@@ -1,0 +1,27 @@
+# Secrets: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node
+node_modules/
+uploads/
+data/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Terraform (state can contain the generated admin key)
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+terraform.tfvars
+
+# Server-side env file written at boot (never committed)
+deploy/.env

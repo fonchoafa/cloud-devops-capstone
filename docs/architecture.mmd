@@ -1,0 +1,38 @@
+flowchart TB
+  dev([Developer]) -->|1. git push| gh[GitHub repository]
+  gh -->|2. triggers| ci
+
+  subgraph ci["GitHub Actions pipeline"]
+    direction LR
+    t[Test<br/>14 tests] --> b[Build image<br/>and health check] --> p[Publish<br/>to GHCR] --> v[Verify live<br/>version]
+  end
+
+  p -->|3. push image| ghcr[(GHCR registry)]
+
+  user([Users]) -->|HTTP 80| sg{{Security group<br/>80 public, 22 my IP}}
+
+  subgraph ec2["AWS: EC2 Ubuntu 24.04 + Docker Compose"]
+    direction LR
+    nginx[nginx<br/>reverse proxy] --> app[Node.js app<br/>non-root, read-only]
+    app -.->|/metrics| prom[Prometheus<br/>127.0.0.1 only]
+    upd[[Updater timer<br/>every 60 s]]
+  end
+
+  sg --> nginx
+  ghcr -->|4. image pull| upd
+  gh -->|git pull| upd
+  v -->|5. poll /health<br/>version = commit| nginx
+
+  subgraph aws["Managed AWS services"]
+    direction LR
+    ddb[(DynamoDB<br/>notes)]
+    s3[(S3<br/>uploads)]
+    ssm[SSM<br/>admin key]
+    cwl[CloudWatch<br/>Logs]
+  end
+
+  app --> ddb
+  app --> s3
+  app --> ssm
+  app -->|awslogs| cwl
+  cwl -->|error filter + alarms| sns[SNS email alerts]

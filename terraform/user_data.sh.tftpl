@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Runs once as root on first boot (cloud-init). Output: /var/log/cloud-init-output.log
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y ca-certificates curl git jq docker.io docker-compose-v2
+systemctl enable --now docker
+
+# ---- Deploy files: the server clones the repo and follows its main branch
+git clone --depth 1 --branch ${repo_branch} ${repo_url} /opt/capstone/src
+
+# ---- Settings for the containers: plain values only. The secret is read from SSM by the app.
+cat > /opt/capstone/src/deploy/.env <<'ENVFILE'
+APP_IMAGE=${app_image}
+AWS_REGION=${region}
+TABLE_NAME=${table_name}
+BUCKET_NAME=${bucket_name}
+SECRET_PARAM_NAME=${secret_param}
+LOG_GROUP=${log_group}
+ENVFILE
+chmod 600 /opt/capstone/src/deploy/.env
+
+# ---- Updater: every minute pull the newest deploy files and the newest image, and restart
+#      only the containers whose image changed. This is how a new release reaches the server.
+cat > /usr/local/bin/capstone-update.sh <<'UPDATER'
+#!/usr/bin/env bash
+set -uo pipefail
+cd /opt/capstone/src
+git pull --ff-only --quiet || echo "git pull failed, keeping the current files"
+cd deploy
+docker compose pull --quiet app || echo "image pull failed (not published yet, or the package is private)"
+docker compose up -d --remove-orphans
+docker image prune -f > /dev/null
+UPDATER
+chmod +x /usr/local/bin/capstone-update.sh
+
+cat > /etc/systemd/system/capstone-update.service <<'UNIT'
+[Unit]
+Description=Pull the newest Cloud Notes release and restart changed containers
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/capstone-update.sh
+UNIT
+
+cat > /etc/systemd/system/capstone-update.timer <<'UNIT'
+[Unit]
+Description=Check for a new Cloud Notes release every minute
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now capstone-update.timer
+
+# ---- First start right away (does not fail the boot if the image is not public yet)
+/usr/local/bin/capstone-update.sh || true
+
+# ---- CloudWatch agent: memory and disk metrics (container logs go through Docker's awslogs driver)
+curl -fsSL -o /tmp/amazon-cloudwatch-agent.deb https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i /tmp/amazon-cloudwatch-agent.deb
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENT'
+{
+  "agent": { "run_as_user": "root" },
+  "metrics": {
+    "namespace": "CloudNotes",
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent"] },
+      "disk": { "measurement": ["used_percent"], "resources": ["/"] }
+    }
+  }
+}
+CWAGENT
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+# ---- Harden SSH: key-only, no root login
+cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'SSHD'
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+X11Forwarding no
+SSHD
+sshd -t
+systemctl reload ssh

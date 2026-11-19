@@ -1,0 +1,131 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  build:
+    name: Build and check the image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t capstone:ci --build-arg APP_VERSION=ci app
+      - name: Run it and wait for the health check
+        run: |
+          docker run -d --name capstone-ci -p 3000:3000 -e ADMIN_KEY=ci-test-key capstone:ci
+          for i in $(seq 1 20); do
+            if curl -fsS http://localhost:3000/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs capstone-ci
+          exit 1
+      - name: Smoke test the running container
+        run: |
+          curl -fsS http://localhost:3000/metrics -o metrics.txt
+          head -5 metrics.txt
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE http://localhost:3000/api/notes/x)
+          test "$code" = "401"
+
+  publish:
+    name: Publish image to GHCR
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Work out image name and version
+        id: meta
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${owner}/cloud-devops-capstone" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(echo "${{ github.sha }}" | cut -c1-7)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          build-args: APP_VERSION=${{ steps.meta.outputs.short_sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-verify:
+    name: Verify the live deployment
+    needs: publish
+    if: vars.LIVE_URL != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.LIVE_URL }}
+    env:
+      LIVE_URL: ${{ vars.LIVE_URL }}
+      WANT: ${{ needs.publish.outputs.short_sha }}
+    steps:
+      - name: Wait until the server runs this version
+        run: |
+          # The server checks for a new image every minute, so allow up to 10 minutes.
+          for i in $(seq 1 40); do
+            got=$(curl -fsS --max-time 5 "$LIVE_URL/health" | jq -r '.version' 2>/dev/null || echo "unreachable")
+            echo "attempt $i: live version = $got, wanted = $WANT"
+            if [ "$got" = "$WANT" ]; then echo "Deployed."; exit 0; fi
+            sleep 15
+          done
+          echo "The server did not reach version $WANT in time"
+          exit 1
+      - name: Smoke checks on the live site
+        run: |
+          curl -fsS "$LIVE_URL/api/notes" > /dev/null
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$LIVE_URL/metrics")
+          test "$code" = "404"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$LIVE_URL/api/notes/x")
+          test "$code" = "401"
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo "- Live site: $LIVE_URL"
+            echo "- Version: $WANT"
+            echo "- Public /metrics blocked (404), DELETE without key refused (401)"
+          } >> "$GITHUB_STEP_SUMMARY"

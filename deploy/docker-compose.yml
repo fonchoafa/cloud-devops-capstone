@@ -1,0 +1,81 @@
+# The production stack that runs on the EC2 server (started by the boot script and kept up
+# to date by the updater timer). Settings come from deploy/.env, which Terraform writes.
+#
+#   Internet --> :80 nginx --> app :3000 --> DynamoDB, S3, SSM (through the instance's IAM role)
+#                                  ^
+#                  Prometheus scrapes app:3000/metrics (Prometheus is reachable only from the server itself)
+
+name: capstone
+
+services:
+  app:
+    image: ${APP_IMAGE}
+    init: true
+    restart: unless-stopped
+    environment:
+      AWS_REGION: ${AWS_REGION}
+      TABLE_NAME: ${TABLE_NAME}          # set: notes live in DynamoDB
+      BUCKET_NAME: ${BUCKET_NAME}        # set: uploads live in S3
+      SECRET_PARAM_NAME: ${SECRET_PARAM_NAME}   # the admin key is read from SSM at start-up
+      TRUST_PROXY: uniquelocal           # trust nginx for the real client IP
+    expose:
+      - "3000"
+    networks:
+      - backend
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 300m
+    cpus: 0.8
+    logging:
+      driver: awslogs                    # container logs go straight to CloudWatch Logs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: ${LOG_GROUP}
+        awslogs-stream: app
+        mode: non-blocking
+        max-buffer-size: 4m
+
+  web:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - backend
+    mem_limit: 64m
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2d
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9090:9090"            # only the server itself; use an SSH tunnel to look at it
+    volumes:
+      - ../monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - backend
+    mem_limit: 200m
+
+networks:
+  backend:
+
+volumes:
+  prometheus-data:
