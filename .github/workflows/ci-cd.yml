@@ -119,7 +119,7 @@ jobs:
           curl -fsS "$LIVE_URL/api/notes" > /dev/null
           code=$(curl -s -o /dev/null -w '%{http_code}' "$LIVE_URL/metrics")
           test "$code" = "404"
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$LIVE_URL//api/notes/00000000-0000-4000-8000-000000000000")
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$LIVE_URL/api/notes/00000000-0000-4000-8000-000000000000")
           test "$code" = "401"
       - name: Summary
         run: |
