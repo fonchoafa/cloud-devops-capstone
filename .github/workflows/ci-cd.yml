@@ -22,7 +22,7 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -36,7 +36,7 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build the image
         run: docker build -t capstone:ci --build-arg APP_VERSION=ci app
       - name: Run it and wait for the health check
@@ -67,7 +67,7 @@ jobs:
       image: ${{ steps.meta.outputs.image }}
       short_sha: ${{ steps.meta.outputs.short_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Work out image name and version
         id: meta
         run: |
